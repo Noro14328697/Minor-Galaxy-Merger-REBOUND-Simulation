@@ -27,10 +27,122 @@ double experiment_rp;
  */
 #define N_PRIMARY_DISK 10000 
 #define N_RADIAL_BINS 4
-#define N_SATELLITE_DISK (N_PRIMARY_DISK/10)
 
 static double initial_R_by_hash[N_PRIMARY_DISK + 1];
 static int initial_R_initialized = 0;
+
+/* Initial values for whole-system conservation diagnostics. */
+static double E_initial = 0.0;
+static struct reb_vec3d L_initial;
+static double Px_initial = 0.0;
+static double Py_initial = 0.0;
+static double Pz_initial = 0.0;
+static double P_scale_initial = 0.0;
+static FILE *conservation_file = NULL;
+static FILE *orbit_file = NULL;
+
+/* Running minima of the two galaxy-separation measurements. */
+static double min_central_separation = HUGE_VAL;
+static double min_com_separation = HUGE_VAL;
+static double time_min_central_separation = 0.0;
+static double time_min_com_separation = 0.0;
+
+/* Calculate total linear momentum and a characteristic momentum scale. */
+void calculate_total_momentum(
+    struct reb_simulation* const r,
+    double *Px,
+    double *Py,
+    double *Pz,
+    double *Pscale
+){
+    *Px = 0.0;
+    *Py = 0.0;
+    *Pz = 0.0;
+    *Pscale = 0.0;
+
+    for (int i = 0; i < r->N; i++){
+        struct reb_particle p = r->particles[i];
+
+        *Px += p.m * p.vx;
+        *Py += p.m * p.vy;
+        *Pz += p.m * p.vz;
+
+        double speed = sqrt(
+            p.vx*p.vx + p.vy*p.vy + p.vz*p.vz
+        );
+        *Pscale += p.m * speed;
+    }
+}
+
+
+/*
+ * Measure galaxy separation in two ways:
+ * 1. Between the two central particles (hashes 0 and 10001).
+ * 2. Between the mass-weighted COMs of all currently present particles
+ *    belonging to each galaxy.
+ */
+int calculate_galaxy_separations(
+    struct reb_simulation* const r,
+    double *d_central,
+    double *d_com
+){
+    double xp = 0.0, yp = 0.0, zp = 0.0, mp = 0.0;
+    double xs = 0.0, ys = 0.0, zs = 0.0, ms = 0.0;
+
+    double xpc = 0.0, ypc = 0.0, zpc = 0.0;
+    double xsc = 0.0, ysc = 0.0, zsc = 0.0;
+    int found_pc = 0, found_sc = 0;
+
+    for (int i = 0; i < r->N; i++){
+        struct reb_particle p = r->particles[i];
+
+        if (p.hash == 0 ||
+            (p.hash >= 1 && p.hash <= N_PRIMARY_DISK)){
+            mp += p.m;
+            xp += p.m * p.x;
+            yp += p.m * p.y;
+            zp += p.m * p.z;
+        }
+
+        if (p.hash == 10001 ||
+            (p.hash >= 10002 &&
+             p.hash < 10002 + experiment_N_satellite)){
+            ms += p.m;
+            xs += p.m * p.x;
+            ys += p.m * p.y;
+            zs += p.m * p.z;
+        }
+
+        if (p.hash == 0){
+            xpc = p.x; ypc = p.y; zpc = p.z;
+            found_pc = 1;
+        }
+        if (p.hash == 10001){
+            xsc = p.x; ysc = p.y; zsc = p.z;
+            found_sc = 1;
+        }
+    }
+
+    if (mp <= 0.0 || ms <= 0.0 || !found_pc || !found_sc){
+        return 0;
+    }
+
+    xp /= mp; yp /= mp; zp /= mp;
+    xs /= ms; ys /= ms; zs /= ms;
+
+    double dxc = xsc - xpc;
+    double dyc = ysc - ypc;
+    double dzc = zsc - zpc;
+
+    double dxm = xs - xp;
+    double dym = ys - yp;
+    double dzm = zs - zp;
+
+    *d_central = sqrt(dxc*dxc + dyc*dyc + dzc*dzc);
+    *d_com = sqrt(dxm*dxm + dym*dym + dzm*dzm);
+
+    return 1;
+}
 
 void add_satellite(
     struct reb_simulation* const r,
@@ -65,8 +177,14 @@ void add_satellite(
     2.0 * r->G * total_mass / r0
     );
 
-    // Angular momentum for a parabolic orbit
-    // with periapsis rp
+    /*
+     * Nominal two-body (Keplerian) pericentre.
+     * The velocity is initialized using the total galaxy masses and
+     * the initial central-position separation r0. In the extended,
+     * evolving N-body system, the measured minimum central-particle
+     * or galaxy-COM separation need not equal this nominal rp.
+     */
+    // Angular momentum for a parabolic orbit with nominal pericentre rp
     double h = sqrt(
         2.0 * r->G * total_mass * rp
     );
@@ -167,10 +285,10 @@ int main(int argc, char* argv[]){
     r->integrator       = REB_INTEGRATOR_LEAPFROG; // Leapfrog integrator
     r->gravity          = REB_GRAVITY_TREE;        // Tree code gravity
     r->boundary         = REB_BOUNDARY_OPEN;       // Open boundary conditions
-    r->opening_angle2   = 1.5;          // This constant determines the accuracy of the tree code gravity estimate.
+    r->opening_angle2   = 0.25;          // This constant determines the accuracy of the tree code gravity estimate.(1.5)
     r->G                = 1;            // Gravitational constant
     r->softening        = 0.02;         // Gravitational softening length
-    r->dt               = 1.5e-2;         // Timestep
+    r->dt               = 0.015;         // Timestep
     const double boxsize = 80.0;        // Size of the simulation box
     reb_simulation_configure_box(r,boxsize,1,1,1);  // Configure the simulation box for the tree code
 
@@ -203,11 +321,15 @@ int main(int argc, char* argv[]){
     // Satellite Galaxy / experiment parameters
     // Change these values when setting up a new test run.
 
-    double inclination_deg = 45.0;        // Orbital inclination in degrees
-    double satellite_central_mass = 0.1; // Satellite central mass
-    double satellite_disk_mass = 0.02;   // Satellite disk mass
-    int N_satellite = N_SATELLITE_DISK;               // Satellite disk particles
-    double rp = 2.5;                      // Periapsis / closest approach
+    double inclination_deg = 45.0;        // Orbital inclination in degrees 45, 0, 90
+    double satellite_central_mass = 0.1; // Satellite central mass 1:10, 1:5, 1:20
+    double satellite_disk_mass = 0.02;   // Satellite disk mass 1:10, 1:5, 1:20
+    const double satellite_particle_mass = 2.0e-5;
+    int N_satellite = (int)llround(
+        satellite_disk_mass / satellite_particle_mass
+    );  // Keeps satellite disk particle mass consistent across mass ratios
+
+    double rp = 2.5;  // Nominal Keplerian pericentre used to set initial velocity
 
     double inclination = inclination_deg * M_PI / 180.0;
 
@@ -227,12 +349,128 @@ int main(int argc, char* argv[]){
         rp
     );
 
+    /* Establish whole-system conservation baselines after all particles
+       have been added and before the first integration step. */
+    E_initial = reb_simulation_energy(r);
+    L_initial = reb_simulation_angular_momentum(r);
+
+    calculate_total_momentum(
+        r,
+        &Px_initial,
+        &Py_initial,
+        &Pz_initial,
+        &P_scale_initial
+    );
+
+    conservation_file = fopen("conservation.txt", "w");
+    if (conservation_file == NULL){
+        fprintf(stderr, "Error opening conservation.txt\n");
+        exit(EXIT_FAILURE);
+    }
+
+    fprintf(conservation_file,
+        "# t E dE_frac Lx Ly Lz dL_abs dL_frac Px Py Pz dP_abs dP_frac N\n"
+    );
+
+    orbit_file = fopen("orbit_separation.txt", "w");
+    if (orbit_file == NULL){
+        fprintf(stderr, "Error opening orbit_separation.txt\n");
+        exit(EXIT_FAILURE);
+    }
+    fprintf(orbit_file,
+        "# t d_central d_com min_d_central t_min_central min_d_com t_min_com\n"
+    );
+
     r->heartbeat = heartbeat;
     reb_simulation_integrate(r, t_end);
+
+    if (conservation_file != NULL){
+        fclose(conservation_file);
+        conservation_file = NULL;
+    }
+
+    if (orbit_file != NULL){
+        fclose(orbit_file);
+        orbit_file = NULL;
+    }
+
+    reb_simulation_free(r);
 }
 
 void heartbeat(struct reb_simulation* const r){
+
+    /*
+     * Measure orbit separations every integration step. This gives a
+     * better estimate of the true minimum than sampling only every 1.0
+     * time unit. Morphology output remains at its original 1.0 cadence.
+     */
+    double d_central = -1.0;
+    double d_com = -1.0;
+
+    if (calculate_galaxy_separations(r, &d_central, &d_com)){
+        if (d_central < min_central_separation){
+            min_central_separation = d_central;
+            time_min_central_separation = r->t;
+        }
+        if (d_com < min_com_separation){
+            min_com_separation = d_com;
+            time_min_com_separation = r->t;
+        }
+
+        if (orbit_file != NULL){
+            fprintf(orbit_file,
+                "%.6f %.12e %.12e %.12e %.6f %.12e %.6f\n",
+                r->t, d_central, d_com,
+                min_central_separation, time_min_central_separation,
+                min_com_separation, time_min_com_separation
+            );
+            fflush(orbit_file);
+        }
+    }
+
     if (reb_simulation_output_check(r, 1.0)){
+
+        /* Whole-system conservation diagnostics.  These include both
+           galaxies, unlike the primary-only morphology quantities below. */
+        double E = reb_simulation_energy(r);
+        double energy_error =
+            (E - E_initial) / fmax(fabs(E_initial), 1e-12);
+
+        struct reb_vec3d L = reb_simulation_angular_momentum(r);
+
+        double dLx = L.x - L_initial.x;
+        double dLy = L.y - L_initial.y;
+        double dLz = L.z - L_initial.z;
+        double dL = sqrt(dLx*dLx + dLy*dLy + dLz*dLz);
+
+        double L_initial_mag = sqrt(
+            L_initial.x*L_initial.x +
+            L_initial.y*L_initial.y +
+            L_initial.z*L_initial.z
+        );
+        double L_error = dL / fmax(L_initial_mag, 1e-12);
+
+        double Px, Py, Pz, Pscale;
+        calculate_total_momentum(r, &Px, &Py, &Pz, &Pscale);
+        (void)Pscale;  /* The normalization uses the initial momentum scale. */
+
+        double dPx = Px - Px_initial;
+        double dPy = Py - Py_initial;
+        double dPz = Pz - Pz_initial;
+        double dP = sqrt(dPx*dPx + dPy*dPy + dPz*dPz);
+        double P_error = dP / fmax(P_scale_initial, 1e-12);
+
+        if (conservation_file != NULL){
+            fprintf(conservation_file,
+                "%.6f %.12e %.12e "
+                "%.12e %.12e %.12e %.12e %.12e "
+                "%.12e %.12e %.12e %.12e %.12e %d\n",
+                r->t, E, energy_error,
+                L.x, L.y, L.z, dL, L_error,
+                Px, Py, Pz, dP, P_error, r->N
+            );
+            fflush(conservation_file);
+        }
 
         /*
          * Print the experiment parameters once at the start.
@@ -255,8 +493,9 @@ void heartbeat(struct reb_simulation* const r){
                    1.2 / satellite_total_mass);
             printf("# inclination_deg = %.1f\n",
                    experiment_inclination_deg);
-            printf("# rp = %.2f\n",
+            printf("# rp_nominal_keplerian = %.2f\n",
                    experiment_rp);
+            printf("# rp_definition = nominal two-body pericentre used for initial velocity\n");
 
             printf("# radial_bins = 0-1, 1-2, 2-3, 3-4.25\n");
 
@@ -272,7 +511,7 @@ void heartbeat(struct reb_simulation* const r){
             printf("# 9 z_rms_core\n");
             printf("# 10 z_core_cm\n");
             printf("# 11 E\n");
-            printf("# 12 Lz_all\n");
+            printf("# 12 Lz_primary_internal\n");
             printf("# 13 x_cm\n");
             printf("# 14 z_cm\n");
             printf("# 15 deltaR_mean_abs\n");
@@ -286,6 +525,15 @@ void heartbeat(struct reb_simulation* const r){
             printf("# 23 A1_1_2\n");
             printf("# 24 A1_2_3\n");
             printf("# 25 A1_3_4.25\n");
+            printf("# 26 dx_cm_core\n");
+            printf("# 27 dy_cm_core\n");
+            printf("# 28 dz_cm_core\n");
+            printf("# 29 dcm_core\n");
+            printf("# 30 A2_all\n");
+            printf("# 31 A2_0_1\n");
+            printf("# 32 A2_1_2\n");
+            printf("# 33 A2_2_3\n");
+            printf("# 34 A2_3_4.25\n");
         }
 
         const int N_primary_disk = N_PRIMARY_DISK;
@@ -313,6 +561,9 @@ void heartbeat(struct reb_simulation* const r){
         double x_cm = 0.0;
         double y_cm = 0.0;
         double z_cm = 0.0;
+        double vx_cm = 0.0;
+        double vy_cm = 0.0;
+        double vz_cm = 0.0;
 
         for (int i = 0; i < r->N; i++){
 
@@ -327,6 +578,9 @@ void heartbeat(struct reb_simulation* const r){
                 x_cm += p.m * p.x;
                 y_cm += p.m * p.y;
                 z_cm += p.m * p.z;
+                vx_cm += p.m * p.vx;
+                vy_cm += p.m * p.vy;
+                vz_cm += p.m * p.vz;
             }
         }
 
@@ -335,7 +589,11 @@ void heartbeat(struct reb_simulation* const r){
          * diagnostic calculation.
          */
         if (N_primary_present == 0){
-            printf("%f 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+            printf("%f "
+                   "0 0 0 0 0 0 0 0 0 0 "
+                   "0 0 0 0 0 0 0 0 0 0 "
+                   "0 0 0 0 0 0 0 0 0 0 "
+                   "0 0 0\n",
                    r->t);
             return;
         }
@@ -343,6 +601,9 @@ void heartbeat(struct reb_simulation* const r){
         x_cm /= total_mass;
         y_cm /= total_mass;
         z_cm /= total_mass;
+        vx_cm /= total_mass;
+        vy_cm /= total_mass;
+        vz_cm /= total_mass;
 
         /*
          * ---------------------------------------------------------
@@ -394,7 +655,7 @@ void heartbeat(struct reb_simulation* const r){
 
         /*
          * Global m=1 lopsidedness:
-         *
+         * Global m=2 two-fold asymmetry:
          * A1 = |sum exp(i phi)| / N.
          *
          * Because all primary disk particles have equal mass,
@@ -402,14 +663,17 @@ void heartbeat(struct reb_simulation* const r){
          */
         double A1_cos_all = 0.0;
         double A1_sin_all = 0.0;
-
+        double A2_cos_all = 0.0;
+        double A2_sin_all = 0.0;
         /*
-         * Radially resolved z_rms and A1.
+         * Radially resolved z_rms, A1, and A2.
          */
         int N_bin[N_RADIAL_BINS] = {0, 0, 0, 0};
         double z2_sum_bin[N_RADIAL_BINS] = {0.0, 0.0, 0.0, 0.0};
         double A1_cos_bin[N_RADIAL_BINS] = {0.0, 0.0, 0.0, 0.0};
         double A1_sin_bin[N_RADIAL_BINS] = {0.0, 0.0, 0.0, 0.0};
+        double A2_cos_bin[N_RADIAL_BINS] = {0.0, 0.0, 0.0, 0.0};
+        double A2_sin_bin[N_RADIAL_BINS] = {0.0, 0.0, 0.0, 0.0};
 
         for (int i = 0; i < r->N; i++){
 
@@ -426,36 +690,27 @@ void heartbeat(struct reb_simulation* const r){
 
                 R2_sum_all += R2;
                 z2_sum_all += dz*dz;
-
+                /* Internal angular momentum about the primary COM. */
                 Lz_all += p.m * (
-                    dx*p.vy - dy*p.vx
+                    dx*(p.vy - vy_cm) - dy*(p.vx - vx_cm)
                 );
 
-                /*
-                 * Radial displacement from the particle's own
-                 * initial radius.
-                 */
                 double deltaR = R - initial_R_by_hash[p.hash];
-
                 deltaR_abs_sum += fabs(deltaR);
                 deltaR2_sum += deltaR*deltaR;
 
-                /*
-                 * Global m=1 mode.
-                 */
                 if (R > 0.0){
                     double cos_phi = dx / R;
                     double sin_phi = dy / R;
-
                     A1_cos_all += cos_phi;
                     A1_sin_all += sin_phi;
+                    A2_cos_all += cos_phi*cos_phi - sin_phi*sin_phi;
+                    A2_sin_all += 2.0*cos_phi*sin_phi;
                 }
 
-                /*
-                 * Radially resolved measurements.
-                 */
+                /* Radial-bin calculations must remain inside this
+                   primary-particle block, where R, dx, dy, and dz exist. */
                 for (int b = 0; b < N_RADIAL_BINS; b++){
-
                     if (R >= R_bin_edges[b] &&
                         R < R_bin_edges[b+1]){
 
@@ -463,10 +718,13 @@ void heartbeat(struct reb_simulation* const r){
                         z2_sum_bin[b] += dz*dz;
 
                         if (R > 0.0){
-                            A1_cos_bin[b] += dx / R;
-                            A1_sin_bin[b] += dy / R;
+                            double cos_phi = dx / R;
+                            double sin_phi = dy / R;
+                            A1_cos_bin[b] += cos_phi;
+                            A1_sin_bin[b] += sin_phi;
+                            A2_cos_bin[b] += cos_phi*cos_phi - sin_phi*sin_phi;
+                            A2_sin_bin[b] += 2.0*cos_phi*sin_phi;
                         }
-
                         break;
                     }
                 }
@@ -492,20 +750,27 @@ void heartbeat(struct reb_simulation* const r){
                 A1_cos_all*A1_cos_all +
                 A1_sin_all*A1_sin_all
             ) / N_primary_present;
-
+        
+        double A2_all =
+            sqrt(
+                A2_cos_all*A2_cos_all +
+                A2_sin_all*A2_sin_all
+            ) / N_primary_present;
         /*
-         * Radial-bin z_rms and A1.
+         * Radial-bin z_rms, A1, and A2.
          *
          * If a bin has no particles, output -1.
          */
         double z_rms_bin[N_RADIAL_BINS];
         double A1_bin[N_RADIAL_BINS];
+        double A2_bin[N_RADIAL_BINS];
 
         for (int b = 0; b < N_RADIAL_BINS; b++){
 
             z_rms_bin[b] = -1.0;
             A1_bin[b] = -1.0;
-
+            A2_bin[b] = -1.0;
+            
             if (N_bin[b] > 0){
 
                 z_rms_bin[b] =
@@ -515,6 +780,12 @@ void heartbeat(struct reb_simulation* const r){
                     sqrt(
                         A1_cos_bin[b]*A1_cos_bin[b] +
                         A1_sin_bin[b]*A1_sin_bin[b]
+                    ) / N_bin[b];
+
+                A2_bin[b] =
+                    sqrt(
+                        A2_cos_bin[b]*A2_cos_bin[b] +
+                        A2_sin_bin[b]*A2_sin_bin[b]
                     ) / N_bin[b];
             }
         }
@@ -573,7 +844,31 @@ void heartbeat(struct reb_simulation* const r){
             y_core_cm /= core_mass;
             z_core_cm /= core_mass;
         }
+        /*
+         * ---------------------------------------------------------
+         * 5b. Compare whole-primary COM with core COM.
+         *
+         * These measure how far the centre of the whole primary
+         * disk has moved relative to its central core.
+         * ---------------------------------------------------------
+         */
+        double dx_cm_core = -1.0;
+        double dy_cm_core = -1.0;
+        double dz_cm_core = -1.0;
+        double dcm_core   = -1.0;
 
+        if (N_core >= N_core_min){
+
+            dx_cm_core = x_cm - x_core_cm;
+            dy_cm_core = y_cm - y_core_cm;
+            dz_cm_core = z_cm - z_core_cm;
+
+            dcm_core = sqrt(
+            dx_cm_core*dx_cm_core +
+            dy_cm_core*dy_cm_core +
+            dz_cm_core*dz_cm_core
+    );
+}
         /*
          * ---------------------------------------------------------
          * 6. Core RMS quantities.
@@ -658,19 +953,9 @@ void heartbeat(struct reb_simulation* const r){
         double f_primary_present =
             (double)N_primary_present /
             (double)N_primary_disk;
-
         /*
          * ---------------------------------------------------------
-         * 10. Total energy.
-         * ---------------------------------------------------------
-         */
-        double E = reb_simulation_energy(r);
-
-        /*
-         * ---------------------------------------------------------
-         * 11. Output.
-         *
-         * The new diagnostics are:
+         * 10. Output.
          *
          * deltaR_mean_abs:
          *     Mean absolute change in each particle's cylindrical
@@ -682,17 +967,24 @@ void heartbeat(struct reb_simulation* const r){
          * A1_all:
          *     Global m=1 lopsidedness.
          *
+         * A2_all:
+         *     Global m=2 lopsidedness.
+         *
          * z_rms_0_1 ... z_rms_3_4.25:
          *     Vertical thickness in four radial bins.
          *
          * A1_0_1 ... A1_3_4.25:
          *     m=1 lopsidedness in the same radial bins.
+         * 
+         * A2_0_1 ... A2_3_4.25:
+         *     m=2 lopsidedness in the same radial bins.
          * ---------------------------------------------------------
          */
         printf(
-            "%f %d %e %d %e %e %e %e %e %e "
-            "%e %e %e %e %e %e %e "
-            "%e %e %e %e %e %e %e %e\n",
+            "%f %d %e %d "
+            "%e %e %e %e %e %e %e %e %e %e "
+            "%e %e %e %e %e %e %e %e %e %e "
+            "%e %e %e %e %e %e %e %e %e %e\n",
             r->t,
             N_primary_present,
             f_primary_present,
@@ -717,7 +1009,16 @@ void heartbeat(struct reb_simulation* const r){
             A1_bin[0],
             A1_bin[1],
             A1_bin[2],
-            A1_bin[3]
+            A1_bin[3],
+            dx_cm_core,
+            dy_cm_core,
+            dz_cm_core,
+            dcm_core,
+            A2_all,
+            A2_bin[0],
+            A2_bin[1],
+            A2_bin[2],
+            A2_bin[3]
         );
     }
 }
