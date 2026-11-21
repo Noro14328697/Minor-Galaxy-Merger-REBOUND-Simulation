@@ -80,39 +80,6 @@ double rp = 2.5;
 
 Change these values before compiling to run a different experiment.
 
-The parameter sweeps used in the associated project are:
-
-  -----------------------------------------------------------------------
-  Experiment              Values varied           Other parameters held
-                                                  fixed
-  ----------------------- ----------------------- -----------------------
-  Orbital inclination     `0°`, `45°`, `90°`      Mass ratio `1:10`,
-                                                  nominal `rp = 2.5`
-
-  Satellite-to-primary    `1:20`, `1:10`, `1:5`   Inclination `45°`,
-  mass ratio                                      nominal `rp = 2.5`
-
-  Nominal pericentre      `1.5`, `2.5`, `3.5`     Inclination `45°`, mass
-                                                  ratio `1:10`
-  -----------------------------------------------------------------------
-
-For the mass-ratio experiments, change both satellite mass parameters
-consistently:
-
-  -----------------------------------------------------------------------
-  Total mass      Satellite central     Satellite disk     Satellite disk
-  ratio                        mass               mass          particles
-  -------------- ------------------ ------------------ ------------------
-  `1:20`                     `0.05`             `0.01`              `500`
-
-  `1:10`                     `0.10`             `0.02`             `1000`
-
-  `1:5`                      `0.20`             `0.04`             `2000`
-  -----------------------------------------------------------------------
-
-The primary galaxy's total mass is `1.2`. The satellite total masses in
-the table are `0.06`, `0.12`, and `0.24`, respectively.
-
 After changing parameters, rebuild with `make` before running the
 simulation again.
 
