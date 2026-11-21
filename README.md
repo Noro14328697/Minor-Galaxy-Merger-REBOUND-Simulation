@@ -20,21 +20,12 @@ standalone REBOUND installation.
     replacing the example files if prompted.
 
 4.  From inside `examples/selfgravitating_disk/`, build the program
-    using:
+    and run using:
 
     ``` bash
-    make
+    make clean && make && ./rebound
     ```
 
-5.  Run the executable produced by the Makefile. For the standard
-    REBOUND example target, this is typically:
-
-    ``` bash
-    ./problem
-    ```
-
-    If your Makefile uses a different executable name, run that target
-    instead.
 
 Run the program from the example directory so that its output files are
 created there.
